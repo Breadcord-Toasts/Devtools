@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import inspect
 import io
@@ -38,6 +39,12 @@ class ANSIEscape:
     def __len__(self) -> int:
         return len(str(self))
 
+    def __add__(self, other: str) -> str:
+        return str(self) + other
+
+    def __rand__(self, other: str) -> str:
+        return str(self) + other
+
 
 def format_embed_desc(items: dict[str, Any | None]) -> str:
     return "\n".join(
@@ -51,7 +58,7 @@ def get_codeblock_content(
     codeblock: str,
     *,
     greedy: bool = True,
-    language_regex: str = "[a-z]+?",
+    language_regex: str = "[a-z]+",
     optional_lang: bool = True,
     strip_inline: bool = True,
     cleanup: bool = True,
@@ -112,6 +119,64 @@ def get_codeblock_content(
     return textwrap.dedent(content)
 
 
+def to_discord_ansi(text: str) -> str:
+    """An attempt at making strings with ANSI escape codes more compatible with discord ANSI codeblocks."""
+
+    # SGR (Select Graphic Rendition) escape codes don't work on discord.
+    # Many SGR ones also don't work, but they are ignored in the client and are hence invisible.
+    non_sgr_codes = re.compile(
+        r"""
+        \x1B            # ESC
+        \[
+        [0-?]*          # Parameter bytes
+        [ -/]*          # Intermediate bytes
+        ([@-l]|[n-~])   # Final byte. Between @ and ~ but excluding "m"
+        """,
+        re.VERBOSE,
+    )
+    text = non_sgr_codes.sub("", text)
+
+    # In the console, escape codes span multiple lines, but discord renders them only on the line they are on.
+    sgr_codes = re.compile(r"\x1B\[(?P<code>[0-?]*)m")
+    lines = text.split("\n")
+    seen_last_line: list[int] = []
+    for i, line in enumerate(tuple(lines)):
+        start_index = 0
+        if seen_last_line:
+            previous_ansi = ANSIEscape(*seen_last_line)
+            lines[i] = previous_ansi + line
+            start_index = len(previous_ansi)
+
+        while (match := sgr_codes.search(line, pos=start_index)) is not None:
+            codes = [
+                int(code)
+                for code in match["code"].split(";") or (0,)
+                # Some codes may be invalid or contain non-digits
+                # For example "<" or ">" (among others), used for private codes
+                # See https://en.wikipedia.org/wiki/ANSI_escape_code#CSI_(Control_Sequence_Introducer)_sequences
+                if all("0" <= char <= "9" for char in code)
+            ]
+            for code in codes:
+                if code == 0:
+                    seen_last_line.clear()
+                else:
+                    seen_last_line.append(code)
+            start_index = match.end()
+    text = "\n".join(lines)
+
+    # We ignored these before, and remove them here
+    for code in sgr_codes.finditer(text):
+        if any("0" <= char <= "9" for char in code["code"]):
+            text = text[:code.start()] + text[code.end():]
+
+    # Escape codes at the very end of the string show up weirdly.
+    text = text.rstrip()
+    while match := re.search(r"\x1B\[(?P<code>[0-?]*)m$", text):
+        text = text[:match.start()]
+
+    return text
+
+
 async def format_exec_output_as_kwargs(
     return_value: Any | _Undefined,
     exception: Exception | _Undefined,
@@ -154,6 +219,58 @@ async def format_exec_output_as_kwargs(
         )
 
 
+class ShellInputModal(discord.ui.Modal, title="Shell input"):
+    shell_input = discord.ui.TextInput(
+        label="Input",
+        placeholder="Input to send to the running shell. Escape sequences will be processed.",
+        style=discord.TextStyle.long,
+    )
+
+    def __init__(self, process: asyncio.subprocess.Process):
+        super().__init__()
+        self.process = process
+
+    async def on_submit(self, interaction: discord.Interaction):
+        stdin: asyncio.StreamWriter = self.process.stdin  # type: ignore  # It won't be None
+        stdin.write(self.shell_input.value.encode().decode("unicode_escape").encode())
+        await interaction.response.defer()
+
+
+class ShellView(discord.ui.View):
+    def __init__(self, process: asyncio.subprocess.Process, *, user_id: int) -> None:
+        super().__init__(timeout=None)
+        self.process = process
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                f'Only <@{self.user_id}> can perform this action!',
+                ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label='Cancel', style=discord.ButtonStyle.red)
+    async def cancel(self, *_) -> None:
+        self.process.terminate()
+        self.stop()
+
+    @discord.ui.button(label='Send input', style=discord.ButtonStyle.gray)
+    async def send_input(self, interaction: discord.Interaction, _) -> None:
+        input_modal = ShellInputModal(self.process)
+        await interaction.response.send_modal(input_modal)
+
+
+def strip_lines(string: str) -> str:
+    lines = string.split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
 ALLOWED_RE_FLAGS: dict[str, re.RegexFlag] = {
     "ASCII": re.RegexFlag.ASCII,
     "A": re.RegexFlag.ASCII,
@@ -184,6 +301,7 @@ DEFAULT_GLOBALS = dict(
     pp=pprint,
     Path=Path,
     io=io,
+    asyncio=asyncio,
 )
 
 
@@ -198,6 +316,7 @@ class Devtools(breadcord.module.ModuleCog):
             self.logger.info(f"Potentially unsafe commands {'enabled' if new else 'disabled'}.")
             self.evaluate.enabled = new
             self.execute.enabled = new
+            self.shell.enabled = new
 
         on_rce_commands_changed(None, setting.value)
 
@@ -350,6 +469,79 @@ class Devtools(breadcord.module.ModuleCog):
             stdout=stdout.getvalue(),
             stderr=stderr.getvalue(),
         ))
+
+    @commands.command(aliases=["sh", "bash", "zsh", "pwsh"], enabled=False)
+    @commands.is_owner()
+    async def shell(self, ctx: commands.Context, *, command: str) -> None:
+        """Runs an arbitrary shell command."""
+        # Codeblock can be of any langauge, because there are so many possible shell languages
+        command = get_codeblock_content(command)
+
+        response = await ctx.reply("Running...")
+        process = await asyncio.create_subprocess_shell(
+            cmd=command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        shell_view = ShellView(process, user_id=ctx.author.id)
+        await response.edit(view=shell_view)
+
+        async def update_message(
+            out: str,
+            err: str,
+            return_code: int | None = None,
+            **edit_kwargs: Any,
+        ) -> None:
+            out = strip_lines(to_discord_ansi(out))
+            err = strip_lines(to_discord_ansi(err))
+
+            merged_msg = ""
+            if return_code is not None:
+                merged_msg += f"Process exited with code {return_code}\n\n"
+            if out.strip():
+                merged_msg += f"**Output:**{make_codeblock(out, lang='ansi')}"
+            if err.strip():
+                merged_msg += f"**Error:**{make_codeblock(err, lang='ansi')}"
+            merged_msg = merged_msg or "Running..."
+
+            if len(merged_msg) <= 2000:
+                await response.edit(content=merged_msg, **edit_kwargs)
+            else:
+                await response.edit(
+                    content=(
+                        (f"Process exited with code {return_code}\n" if return_code is not None else "")
+                        + "Output too long, uploading as file."
+                    ),
+                    attachments=[
+                        discord.File(io.BytesIO(content.encode()), filename=f"{name}.txt")
+                        for content, name in (
+                            (out, "stdout"),
+                            (err, "stderr"),
+                        )
+                        if content.strip()
+                    ],
+                    **edit_kwargs
+                )
+
+        update_setting: Setting = self.settings.shell_update_interval_seconds  # pyright: ignore [reportAssignmentType]
+        update_interval: float | int = update_setting.value
+
+        stdout: str = ""
+        stderr: str = ""
+        await asyncio.sleep(0.25)  # Give the process a bit of time to start
+        while process.returncode is None:
+            add_out = (await process.stdout.read(1024)).decode()  # pyright: ignore [reportOptionalMemberAccess]
+            add_err = (await process.stderr.read(1024)).decode()  # pyright: ignore [reportOptionalMemberAccess]
+            if add_out or add_err:
+                stdout += add_out
+                stderr += add_err
+                await update_message(stdout, stderr, view=shell_view)
+            await asyncio.sleep(update_interval)
+        stdout_r, stderr_r = await process.communicate()
+        stdout += stdout_r.decode()
+        stderr += stderr_r.decode()
+        await update_message(stdout, stderr, process.returncode, view=None)
 
 
 async def setup(bot: breadcord.Bot, module: breadcord.module.Module) -> None:

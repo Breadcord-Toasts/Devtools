@@ -1,2 +1,5 @@
 # Enables commands that may pose a security risk, sucha s the ability to execute arbitrary code
 enable_unsafe_commands = true
+
+# How often to update the output of the shell command
+shell_update_interval_seconds = 1.0
