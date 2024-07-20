@@ -1,0 +1,2 @@
+# Enables commands that may pose a security risk, sucha s the ability to execute arbitrary code
+enable_unsafe_commands = true
