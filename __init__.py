@@ -263,6 +263,16 @@ DEFAULT_GLOBALS = dict(
 )
 
 
+async def regex_flag_autocomplete(_, query: str) -> list[discord.app_commands.Choice[str]]:
+    if not query:
+        return [discord.app_commands.Choice(name=flag_name, value=flag_name) for flag_name in ALLOWED_RE_FLAGS.keys()]
+    return [
+        discord.app_commands.Choice(name=flag_name, value=flag_name)
+        for flag_name in ALLOWED_RE_FLAGS.keys()
+        if query.lower() in flag_name.lower()
+    ]
+
+
 class Devtools(breadcord.module.ModuleCog):
     def __init__(self, module_id: str) -> None:
         super().__init__(module_id)
@@ -286,6 +296,9 @@ class Devtools(breadcord.module.ModuleCog):
         del DEFAULT_GLOBALS["session"]
 
     @discord.app_commands.command()
+    @discord.app_commands.autocomplete(
+        flags=regex_flag_autocomplete,
+    )
     async def regex_test(self, interaction: discord.Interaction, *, regex: str, match_against: str, flags: str = ""):
         filtered_flags: list[re.RegexFlag] = []
         for flag in flags.replace(",", " ").split():
