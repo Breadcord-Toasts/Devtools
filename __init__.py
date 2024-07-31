@@ -97,7 +97,7 @@ def get_codeblock_content(
     regex = re.compile(
         rf"""
         ```
-        (?P<language>(?:{language_regex}){'?' if language_regex and optional_lang else ''}
+        (?P<language>(?:{language_regex}){'?' if language_regex and optional_lang else ''})
         (?P<content>.+{'' if greedy else '?'})
         ```
         """,
