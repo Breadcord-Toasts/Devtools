@@ -376,6 +376,7 @@ class Devtools(breadcord.module.ModuleCog):
         # language=regexp
         code = get_codeblock_content(code, language_regex=r"py(thon)?")
         spoofed_globals: dict = DEFAULT_GLOBALS | dict(
+            message=ctx.message,
             ctx=ctx,
             bot=self.bot,
         )
@@ -413,6 +414,7 @@ class Devtools(breadcord.module.ModuleCog):
             f"    {line}" for line in code.splitlines()
         )
         spoofed_globals: dict = DEFAULT_GLOBALS | dict(
+            message=ctx.message,
             ctx=ctx,
             bot=self.bot,
         )
